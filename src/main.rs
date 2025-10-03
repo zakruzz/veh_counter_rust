@@ -1,13 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use ndarray::{Array4, ArrayViewD, CowArray, IxDyn};
 use once_cell::sync::Lazy;
 use opencv::{
-    core::{copy_make_border, Mat, Rect, Scalar, Size, CV_32F, BORDER_CONSTANT},
+    core::{copy_make_border, Mat, Rect, Scalar, Size, BORDER_CONSTANT, CV_32F},
+    dnn::{self, blob_from_image, Net, DNN_BACKEND_CUDA, DNN_BACKEND_OPENCV, DNN_TARGET_CPU, DNN_TARGET_CUDA, DNN_TARGET_CUDA_FP16},
     highgui, imgproc, prelude::*,
     videoio::{self, VideoCapture, VideoCaptureTrait},
 };
-use ort::{environment::Environment, session::Session, session::SessionBuilder, value::Value};
 use serde::Serialize;
 use sqlx::{mysql::MySqlPoolOptions, MySql, Pool};
 use std::{
@@ -41,7 +40,7 @@ fn show_preview(img: &Mat) {
 
 /* ===================== CLI ===================== */
 #[derive(Parser, Debug, Clone)]
-#[command(about = "Realtime vehicle counter (OpenCV/ONNX). EV detection OFF. MySQL optional. MQTT args kept but disabled.")]
+#[command(about = "Realtime vehicle counter (OpenCV DNN). EV detection OFF. MySQL optional. MQTT args kept but disabled.")]
 struct Args {
     // Model
     #[arg(long, default_value = "models/best.onnx")]
@@ -110,17 +109,19 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     scan_interval: u64, // dummy
 
-    /* == GPU options == */
-    /// Prefer TensorRT EP (Jetson). Butuh ORT build dgn TensorRT.
-    #[arg(long, default_value_t = false)]
-    use_tensorrt: bool,
-    /// Prefer CUDA EP. Butuh ORT build dgn CUDA.
+    /* == GPU options untuk OpenCV DNN == */
+    /// Jalankan di CUDA (kalau OpenCV kamu dibangun dengan CUDA/cuDNN)
     #[arg(long, default_value_t = false)]
     use_cuda: bool,
-    /// Aktifkan FP16 TensorRT (kalau model dan device support)
+    /// Target FP16 (biasanya lebih kencang di Jetson)
+    #[arg(long, default_value_t = true)]
+    fp16: bool,
+
+    // Hanya agar kompatibel CLI lama; diabaikan
+    #[arg(long, default_value_t = false)]
+    use_tensorrt: bool,
     #[arg(long, default_value_t = false)]
     trt_fp16: bool,
-    /// Folder cache engine TensorRT
     #[arg(long, default_value = "trt_cache")]
     trt_cache: String,
 }
@@ -142,75 +143,29 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Siapkan folder (kompatibel)
-    for d in [&args.video_dir, &args.done_dir, &args.research_dir, &args.trt_cache] {
+    for d in [&args.video_dir, &args.done_dir, &args.research_dir] {
         fs::create_dir_all(d).with_context(|| format!("make dir {}", d))?;
     }
     log_ok("BOOT", "dirs ready");
 
-    /* -------- ONNX Runtime + GPU EP -------- */
-    let env = Environment::builder().with_name("veh-rt").build()?.into_arc();
-
-    // Siapkan SessionBuilder dengan optimasi maksimum
-    let mut sb = SessionBuilder::new(&env)?
-        .with_optimization_level(ort::GraphOptimizationLevel::Level3)?;
-
-    // Kumpulkan providers sesuai flag, urutan = prioritas
-    // Di Jetson: TensorRT biasanya paling kenceng; lalu CUDA; terakhir CPU
-    #[allow(unused_mut)]
-    let mut providers: Vec<ort::execution_providers::ExecutionProvider> = Vec::new();
-
-    // TensorRT
-    if args.use_tensorrt {
-        #[cfg(feature = "tensorrt")]
-        {
-            use ort::execution_providers::{TensorRTExecutionProviderOptions, ExecutionProvider};
-            let mut trt = TensorRTExecutionProviderOptions::default();
-            trt.trt_fp16_enable = args.trt_fp16;
-            trt.trt_engine_cache_enable = true;
-            trt.trt_engine_cache_path = Some(args.trt_cache.clone());
-            providers.push(ExecutionProvider::TensorRT(trt));
-            log_info("ONNX", "Try TensorRT EP…");
-        }
-        #[cfg(not(feature = "tensorrt"))]
-        {
-            log_warn("ONNX", "Binary ORT tidak di-compile dengan fitur 'tensorrt'; skip TensorRT EP");
-        }
-    }
-
-    // CUDA
+    // ONNX via OpenCV DNN (CUDA kalau diminta)
+    let mut net: Net = dnn::read_net_from_onnx(&args.model)
+        .with_context(|| format!("read_net_from_onnx({})", args.model))?;
     if args.use_cuda {
-        #[cfg(feature = "cuda")]
-        {
-            use ort::execution_providers::{CUDAExecutionProviderOptions, ExecutionProvider};
-            // default: pakai device 0
-            let cuda = CUDAExecutionProviderOptions {
-                device_id: 0,
-                cudnn_conv_algo_search: None,
-                gpu_mem_limit: None, // pakai default ORT
-                arena_extend_strategy: None,
-                do_copy_in_default_stream: None,
-                has_user_compute_stream: None,
-                default_memory_arena_cfg: None,
-            };
-            providers.push(ExecutionProvider::CUDA(cuda));
-            log_info("ONNX", "Try CUDA EP…");
+        // butuh OpenCV yang dibuild WITH_CUDA + WITH_CUDNN + OPENCV_DNN_CUDA
+        net.set_preferable_backend(DNN_BACKEND_CUDA)?;
+        if args.fp16 {
+            net.set_preferable_target(DNN_TARGET_CUDA_FP16)?;
+        } else {
+            net.set_preferable_target(DNN_TARGET_CUDA)?;
         }
-        #[cfg(not(feature = "cuda"))]
-        {
-            log_warn("ONNX", "Binary ORT tidak di-compile dengan fitur 'cuda'; skip CUDA EP");
-        }
-    }
-
-    // Daftarkan providers kalau ada; kalau tidak ada, CPU saja.
-    if !providers.is_empty() {
-        sb = sb.with_execution_providers(providers)?;
+        log_ok("DNN", "Backend CUDA aktif");
     } else {
-        log_warn("ONNX", "No GPU EP requested/available; using CPU EP");
+        net.set_preferable_backend(DNN_BACKEND_OPENCV)?;
+        net.set_preferable_target(DNN_TARGET_CPU)?;
+        log_warn("DNN", "Backend CPU (set --use_cuda untuk GPU)");
     }
-
-    // Build session
-    let session: Session = sb.with_model_from_file(&args.model)?;
-    log_ok("ONNX", &format!("model loaded: {}", args.model));
+    log_ok("DNN", &format!("model loaded: {}", args.model));
 
     // Kelas (cari license_plate utk overlay saja)
     let class_names: Vec<String> =
@@ -302,26 +257,18 @@ async fn main() -> Result<()> {
         let orig_w = frame.cols();
         let orig_h = frame.rows();
 
-        // preprocess + ONNX
+        // ========= preprocess + DNN forward =========
         let (padded, info) = letterbox(&frame, args.imgsz)?;
-        let input_chw: Array4<f32> = hwc_bgr_to_chw_rgb_normalized(&padded)?;
-        let input_dyn = input_chw.into_dyn();
-        let input_view: ArrayViewD<f32> = input_dyn.view();
-        let input_cow: CowArray<'_, f32, IxDyn> = CowArray::from(input_view);
-        let inputs = vec![Value::from_array(session.allocator(), &input_cow)?];
+        // blob_from_image: swapRB=true (BGR->RGB), scalefactor=1/255, size=imgsz
+        let mut blob = blob_from_image(
+            &padded, 1.0/255.0, Size::new(args.imgsz, args.imgsz),
+            Scalar::new(0.0,0.0,0.0,0.0), true, false, CV_32F
+        )?;
+        net.set_input(&blob, "", 1.0, Scalar::default())?;
+        let out = net.forward("")?; // output terakhir
 
-        let outputs = session.run(inputs)?;
-        let out_tensor: ort::tensor::OrtOwnedTensor<f32, _> = outputs[0].try_extract()?;
-        let out_array = out_tensor.view().to_owned().into_dyn();
-
-        // decode YOLO
-        let shape = out_array.shape().to_vec();
-        let class_offset_is_second_dim = shape.len() == 3 && shape[1] < shape[2];
-
-        let mut dets = decode_yolov8_output(
-            &out_array, &info, orig_w, orig_h, class_offset_is_second_dim, args.conf_vehicle,
-        );
-
+        // ========= decode YOLO (dari Mat OpenCV) =========
+        let mut dets = decode_yolov8_from_mat(&out, &info, orig_w, orig_h, args.conf_vehicle)?;
         // pisah plate (untuk overlay label saja)
         let mut plates = Vec::<Detection>::new();
         if let Some(pid) = plate_class_id {
@@ -329,12 +276,9 @@ async fn main() -> Result<()> {
             for d in dets.into_iter() {
                 if d.class_id == pid {
                     if d.score >= args.conf_plate { plc.push(d); }
-                } else {
-                    veh.push(d);
-                }
+                } else { veh.push(d); }
             }
-            dets = veh;
-            plates = plc;
+            dets = veh; plates = plc;
         }
 
         // NMS
@@ -357,12 +301,8 @@ async fn main() -> Result<()> {
                     t.last_center = center(&t.bbox_xyxy);
                     t.age += 1;
                     assigned[i] = true;
-                } else {
-                    t.miss += 1;
-                }
-            } else {
-                t.miss += 1;
-            }
+                } else { t.miss += 1; }
+            } else { t.miss += 1; }
         }
         for (i, d) in dets.iter().enumerate() {
             if !assigned[i] {
@@ -380,7 +320,6 @@ async fn main() -> Result<()> {
         const MIN_MOVE: f32 = 30.0;
         const DUP_IOU: f32 = 0.5;
         const DUP_DIST: f32 = 60.0;
-
         for t in tracks.iter_mut() {
             t.last_center = center(&t.bbox_xyxy);
             if !t.counted && t.age >= MIN_AGE && dist(t.first_center, t.last_center) >= MIN_MOVE {
@@ -401,8 +340,7 @@ async fn main() -> Result<()> {
         // PREVIEW
         if args.preview {
             let mut vis = frame.try_clone()?;
-
-            // Gambar TRACK: hijau + label ID
+            // TRACK: hijau + label ID
             for t in &tracks {
                 let x1 = t.bbox_xyxy[0].max(0.0) as i32;
                 let y1 = t.bbox_xyxy[1].max(0.0) as i32;
@@ -417,8 +355,7 @@ async fn main() -> Result<()> {
                     imgproc::FONT_HERSHEY_SIMPLEX, 0.6,
                     Scalar::new(255.0,255.0,255.0,0.0), 2, imgproc::LINE_AA, false)?;
             }
-
-            // Gambar PLATE: kuning + label (overlay info saja)
+            // PLATE: kuning
             for p in &plates {
                 let x1 = p.bbox_xyxy[0].max(0.0) as i32;
                 let y1 = p.bbox_xyxy[1].max(0.0) as i32;
@@ -432,7 +369,6 @@ async fn main() -> Result<()> {
                     imgproc::FONT_HERSHEY_SIMPLEX, 0.6,
                     Scalar::new(255.0,255.0,0.0,0.0), 2, imgproc::LINE_AA, false)?;
             }
-
             // Ringkasan
             imgproc::put_text(&mut vis, &format!("VEH: {}", total_vehicle),
                 opencv::core::Point::new(16, 32),
@@ -445,7 +381,7 @@ async fn main() -> Result<()> {
 
         frames_processed = frames_processed.saturating_add(1);
 
-        // Push ke DB periodik (kolom 'count' kita isi vehicle total)
+        // Push ke DB periodik (kolom 'count' = total kendaraan)
         if let Some(pool) = db_pool.as_ref() {
             if last_db_push.elapsed() >= Duration::from_secs(DB_PUSH_SECS) && total_vehicle != last_pushed_count {
                 let now_ts = OffsetDateTime::now_utc().unix_timestamp();
@@ -540,7 +476,7 @@ fn nms(mut dets: Vec<Detection>, iou_thr: f32) -> Vec<Detection> {
     }
     keep
 }
-struct LetterboxInfo { scale: f32, pad_x: f32, pad_y: f32}
+struct LetterboxInfo { scale: f32, pad_x: f32, pad_y: f32 }
 fn letterbox(bgr: &Mat, new_size: i32) -> Result<(Mat, LetterboxInfo)> {
     let (h, w) = (bgr.rows(), bgr.cols());
     let r = (new_size as f32 / w as f32).min(new_size as f32 / h as f32);
@@ -554,62 +490,76 @@ fn letterbox(bgr: &Mat, new_size: i32) -> Result<(Mat, LetterboxInfo)> {
 
     let mut padded = Mat::default();
     copy_make_border(&resized, &mut padded, top, bottom, left, right, BORDER_CONSTANT, Scalar::new(114.0,114.0,114.0,0.0))?;
-    Ok((padded, LetterboxInfo { scale: r, pad_x: left as f32, pad_y: top as f32}))
+    Ok((padded, LetterboxInfo { scale: r, pad_x: left as f32, pad_y: top as f32 }))
 }
-fn hwc_bgr_to_chw_rgb_normalized(mat: &Mat) -> Result<Array4<f32>> {
-    let mut rgb = Mat::default();
-    imgproc::cvt_color(mat, &mut rgb, imgproc::COLOR_BGR2RGB, 0)?;
-    let mut f32m = Mat::default();
-    rgb.convert_to(&mut f32m, CV_32F, 1.0 / 255.0, 0.0)?;
 
-    let (h, w) = (f32m.rows() as usize, f32m.cols() as usize);
-    let total = h * w * 3;
-    let bytes = f32m.data_bytes()?;
-    let mut hwc = vec![0f32; total];
-    for i in 0..total {
-        let p = &bytes[i * 4..i * 4 + 4];
-        hwc[i] = f32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-    }
-    let mut chw = vec![0f32; total];
-    for y in 0..h {
-        for x in 0..w {
-            for ch in 0..3 {
-                let hwc_idx = (y * w + x) * 3 + ch;
-                let chw_idx = ch * (h * w) + y * w + x;
-                chw[chw_idx] = hwc[hwc_idx];
-            }
-        }
-    }
-    Ok(Array4::from_shape_vec((1, 3, h, w), chw)?)
-}
-fn decode_yolov8_output(
-    output: &ndarray::ArrayD<f32>, info: &LetterboxInfo,
-    orig_w: i32, orig_h: i32, class_offset_is_second_dim: bool, conf_thr: f32,
-) -> Vec<Detection> {
-    let view = output.view();
-    let shape = view.shape().to_vec();
-    let (n_dim, c_dim) = if class_offset_is_second_dim { (shape[2], shape[1]) } else { (shape[1], shape[2]) };
+/* === Decoder YOLOv8 untuk output OpenCV DNN (Mat) === */
+fn decode_yolov8_from_mat(
+    out: &Mat,
+    info: &LetterboxInfo,
+    orig_w: i32,
+    orig_h: i32,
+    conf_thr: f32,
+) -> Result<Vec<Detection>> {
+    // Bentuk tipikal: [1, C, N] atau [1, N, C] -> Mat dims bisa 2D/3D
+    let sizes = out.size()?; // Vector<i32>
+    let dims = sizes.len();
+    let (n_dim, c_dim, transposed) = if dims == 3 {
+        // [1, C, N] atau [1, N, C]
+        let a = sizes.get(1)? as usize;
+        let b = sizes.get(2)? as usize;
+        // heuristik: kalau channel kecil (<10) berarti [1, C, N]
+        if a < b { (b, a, false) } else { (a, b, true) }
+    } else {
+        // [N, C]
+        (sizes.get(0)? as usize, sizes.get(1)? as usize, false)
+    };
 
+    // Data float32 kontinu
+    let data = out.data_typed::<f32>()?; // &mut [f32]
+    let dat: &[f32] = &*data;            // sebagai &[f32]
     let mut dets = Vec::<Detection>::new();
+
     for i in 0..n_dim {
-        let read = |c: usize| -> f32 { if class_offset_is_second_dim { view[[0, c, i]] } else { view[[0, i, c]] } };
+        let read = |c: usize| -> f32 {
+            if transposed {
+                // [1, N, C]
+                dat[i * c_dim + c]
+            } else if dims == 3 {
+                // [1, C, N]
+                dat[c * n_dim + i]
+            } else {
+                // [N, C]
+                dat[i * c_dim + c]
+            }
+        };
         let cx = read(0); let cy = read(1); let ww = read(2); let hh = read(3);
 
         // cari kelas score max
-        let mut best_id = -1; let mut best_sc = 0.0f32;
-        for c in 4..c_dim { let s = read(c); if s > best_sc { best_sc = s; best_id = (c - 4) as i32; } }
+        let mut best_id = -1;
+        let mut best_sc = 0.0f32;
+        for c in 4..c_dim {
+            let s = read(c);
+            if s > best_sc { best_sc = s; best_id = (c - 4) as i32; }
+        }
         if best_sc < conf_thr { continue; }
 
         // xywh(padded) -> xyxy(orig)
         let (mut x1, mut y1, mut x2, mut y2) = (cx - ww/2.0, cy - hh/2.0, cx + ww/2.0, cy + hh/2.0);
-        x1 = (x1 - info.pad_x) / info.scale; y1 = (y1 - info.pad_y) / info.scale;
-        x2 = (x2 - info.pad_x) / info.scale; y2 = (y2 - info.pad_y) / info.scale;
-        x1 = x1.clamp(0.0, orig_w as f32 - 1.0); x2 = x2.clamp(0.0, orig_w as f32 - 1.0);
-        y1 = y1.clamp(0.0, orig_h as f32 - 1.0); y2 = y2.clamp(0.0, orig_h as f32 - 1.0);
+        x1 = (x1 - info.pad_x) / info.scale;
+        y1 = (y1 - info.pad_y) / info.scale;
+        x2 = (x2 - info.pad_x) / info.scale;
+        y2 = (y2 - info.pad_y) / info.scale;
+
+        // clamp
+        x1 = x1.clamp(0.0, orig_w as f32 - 1.0);
+        x2 = x2.clamp(0.0, orig_w as f32 - 1.0);
+        y1 = y1.clamp(0.0, orig_h as f32 - 1.0);
+        y2 = y2.clamp(0.0, orig_h as f32 - 1.0);
 
         dets.push(Detection { bbox_xyxy: [x1, y1, x2, y2], score: best_sc, class_id: best_id });
     }
-    dets
+    Ok(dets)
 }
 
 /* ===================== (optional) EV helper - OFF ===================== */
